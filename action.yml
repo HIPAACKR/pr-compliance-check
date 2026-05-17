@@ -7,16 +7,9 @@ branding:
   color: 'blue'
 
 inputs:
-  api-url:
-    description: 'Compliance API submission URL'
-    required: true
   api-key:
     description: 'Compliance API key'
     required: true
-  status-url:
-    description: 'Compliance API polling URL'
-    required: false
-    default: ''
   github-token:
     description: 'GitHub token for posting PR comments'
     required: true
@@ -56,7 +49,6 @@ runs:
     - name: Submit diff to compliance API
       shell: bash
       env:
-        COMPLIANCE_API_URL: ${{ inputs.api-url }}
         COMPLIANCE_API_KEY: ${{ inputs.api-key }}
       run: |
         COMMIT_MESSAGES=$(cat /tmp/commit_messages.json)
@@ -68,7 +60,7 @@ runs:
           -F "commit_messages=$COMMIT_MESSAGES" \
           --max-time 60 \
           -o /tmp/submit_response.json \
-          "$COMPLIANCE_API_URL"
+          "https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check/"
 
         JOB_ID=$(jq -r '.job_id' /tmp/submit_response.json)
         if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "null" ]; then
@@ -82,14 +74,11 @@ runs:
     - name: Poll for result
       shell: bash
       env:
-        COMPLIANCE_STATUS_URL: ${{ inputs.status-url }}
-        COMPLIANCE_API_URL: ${{ inputs.api-url }}
         COMPLIANCE_API_KEY: ${{ inputs.api-key }}
         POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval }}
         POLL_TIMEOUT_SECONDS: ${{ inputs.poll-timeout }}
       run: |
         JOB_ID=$(cat /tmp/job_id.txt)
-        STATUS_BASE="${COMPLIANCE_STATUS_URL:-${COMPLIANCE_API_URL}/status}"
 
         DEADLINE=$(( $(date +%s) + POLL_TIMEOUT_SECONDS ))
         ATTEMPT=0
@@ -104,7 +93,7 @@ runs:
             -H "Authorization: Bearer $COMPLIANCE_API_KEY" \
             --max-time 30 \
             -o /tmp/poll_response.json \
-            "${STATUS_BASE}/${JOB_ID}"
+            "https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check/jobs/${JOB_ID}"
 
           STATUS=$(jq -r '.status' /tmp/poll_response.json)
           echo "Attempt $ATTEMPT - status: $STATUS"
