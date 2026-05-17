@@ -14,4 +14,3 @@ jobs:
       - uses: HIPAACKR/pr-compliance-check@v1
         with:
           api-key: ${{ secrets.COMPLIANCE_API_KEY }}
-          api-url: ${{ secrets.COMPLIANCE_API_URL }}
