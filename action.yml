@@ -1,0 +1,147 @@
+name: 'Compliance Check'
+description: 'Submits PR diff to a compliance API and posts the analysis as a PR comment.'
+author: 'UbiComply'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  api-url:
+    description: 'Compliance API submission URL'
+    required: true
+  api-key:
+    description: 'Compliance API key'
+    required: true
+  status-url:
+    description: 'Compliance API polling URL'
+    required: false
+    default: ''
+  github-token:
+    description: 'GitHub token for posting PR comments'
+    required: true
+    default: ${{ github.token }}
+  poll-interval:
+    description: 'Seconds between status polls'
+    required: false
+    default: '5'
+  poll-timeout:
+    description: 'Max seconds to wait for a result'
+    required: false
+    default: '1500'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ github.event.pull_request.head.sha }}
+
+    - name: Generate diff and collect commit messages
+      shell: bash
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+        git diff "$MERGE_BASE" "$HEAD_SHA" > /tmp/pr.diff
+        echo "Diff size: $(wc -c < /tmp/pr.diff) bytes"
+
+        git log "$MERGE_BASE".."$HEAD_SHA" --format="%s" | \
+          jq -R . | jq -s . > /tmp/commit_messages.json
+        echo "Commit messages: $(cat /tmp/commit_messages.json)"
+
+    - name: Submit diff to compliance API
+      shell: bash
+      env:
+        COMPLIANCE_API_URL: ${{ inputs.api-url }}
+        COMPLIANCE_API_KEY: ${{ inputs.api-key }}
+      run: |
+        COMMIT_MESSAGES=$(cat /tmp/commit_messages.json)
+
+        curl -sS -X POST \
+          -H "Authorization: Bearer $COMPLIANCE_API_KEY" \
+          -F "diff=@/tmp/pr.diff;type=text/plain" \
+          -F "readme=@README.md;type=text/plain" \
+          -F "commit_messages=$COMMIT_MESSAGES" \
+          --max-time 60 \
+          -o /tmp/submit_response.json \
+          "$COMPLIANCE_API_URL"
+
+        JOB_ID=$(jq -r '.job_id' /tmp/submit_response.json)
+        if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "null" ]; then
+          echo "::error::Submit did not return a job_id"
+          cat /tmp/submit_response.json
+          exit 1
+        fi
+        echo "$JOB_ID" > /tmp/job_id.txt
+        echo "Submitted job: $JOB_ID"
+
+    - name: Poll for result
+      shell: bash
+      env:
+        COMPLIANCE_STATUS_URL: ${{ inputs.status-url }}
+        COMPLIANCE_API_URL: ${{ inputs.api-url }}
+        COMPLIANCE_API_KEY: ${{ inputs.api-key }}
+        POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval }}
+        POLL_TIMEOUT_SECONDS: ${{ inputs.poll-timeout }}
+      run: |
+        JOB_ID=$(cat /tmp/job_id.txt)
+        STATUS_BASE="${COMPLIANCE_STATUS_URL:-${COMPLIANCE_API_URL}/status}"
+
+        DEADLINE=$(( $(date +%s) + POLL_TIMEOUT_SECONDS ))
+        ATTEMPT=0
+        while :; do
+          ATTEMPT=$((ATTEMPT + 1))
+          if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+            echo "::error::Polling timed out after ${POLL_TIMEOUT_SECONDS}s"
+            exit 1
+          fi
+
+          curl -sS \
+            -H "Authorization: Bearer $COMPLIANCE_API_KEY" \
+            --max-time 30 \
+            -o /tmp/poll_response.json \
+            "${STATUS_BASE}/${JOB_ID}"
+
+          STATUS=$(jq -r '.status' /tmp/poll_response.json)
+          echo "Attempt $ATTEMPT - status: $STATUS"
+
+          case "$STATUS" in
+            success)
+              jq -r '.result' /tmp/poll_response.json > /tmp/api_response.md
+              echo "Got result ($(wc -c < /tmp/api_response.md) bytes)"
+              break
+              ;;
+            failed)
+              ERR=$(jq -r '.error // "unknown error"' /tmp/poll_response.json)
+              printf '## 🔒 Compliance Review\n\n❌ Analysis failed.\n\n```\n%s\n```\n' "$ERR" \
+                > /tmp/api_response.md
+              break
+              ;;
+            pending|running|queued)
+              sleep "$POLL_INTERVAL_SECONDS"
+              ;;
+            *)
+              echo "::error::Unexpected status: $STATUS"
+              cat /tmp/poll_response.json
+              exit 1
+              ;;
+          esac
+        done
+
+    - name: Post comment on PR
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        BODY=$(jq -Rs '{body: .}' < /tmp/api_response.md)
+        curl -sS -X POST \
+          -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          -d "$BODY" \
+          "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments"
