@@ -42,7 +42,17 @@ runs:
         git diff "$MERGE_BASE" "$HEAD_SHA" > /tmp/pr.diff
         echo "Diff size: $(wc -c < /tmp/pr.diff) bytes"
 
-        git log "$MERGE_BASE".."$HEAD_SHA" --format="%s" | \
+        # Guard: skip analysis if diff is empty (e.g. whitespace-only or metadata-only PR)
+        if [ ! -s /tmp/pr.diff ]; then
+          echo "Empty diff — nothing to analyze."
+          exit 0
+        fi
+
+        # Collect subject + body per commit, NUL-delimited to safely handle newlines.
+        # Each element in the JSON array is one full commit message (subject + blank line + body),
+        # with trailing whitespace trimmed. Commits with no body produce subject-only strings.
+        git log "$MERGE_BASE".."$HEAD_SHA" --format="%s%n%n%b%x00" | \
+          awk 'BEGIN{RS="\0"} {gsub(/[[:space:]]+$/, ""); if (length > 0) print}' | \
           jq -R . | jq -s . > /tmp/commit_messages.json
         echo "Commit messages: $(cat /tmp/commit_messages.json)"
 
@@ -53,12 +63,19 @@ runs:
       run: |
         COMMIT_MESSAGES=$(cat /tmp/commit_messages.json)
 
+        # Include README only if it exists in the repo root
+        if [ -f README.md ]; then
+          README_ARG=(-F "readme=@README.md;type=text/plain")
+        else
+          README_ARG=()
+        fi
+
         curl -sS -X POST \
           -H "Authorization: Bearer $COMPLIANCE_API_KEY" \
           -F "diff=@/tmp/pr.diff;type=text/plain" \
-          -F "readme=@README.md;type=text/plain" \
+          "${README_ARG[@]}" \
           -F "commit_messages=$COMMIT_MESSAGES" \
-          --max-time 60 \
+          --max-time 120 \
           -o /tmp/submit_response.json \
           "https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check/"
 
