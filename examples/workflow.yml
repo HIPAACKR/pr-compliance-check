@@ -2,11 +2,9 @@ name: Compliance Check
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-
 permissions:
   pull-requests: write
   contents: read
-
 jobs:
   compliance-check:
     runs-on: ubuntu-latest
@@ -14,3 +12,4 @@ jobs:
       - uses: HIPAACKR/pr-compliance-check@v1
         with:
           api-key: ${{ secrets.COMPLIANCE_API_KEY }}
+          frameworks: '["hipaa","cmmc"]'
