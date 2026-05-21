@@ -14,6 +14,10 @@ inputs:
     description: 'GitHub token for posting PR comments'
     required: true
     default: ${{ github.token }}
+  frameworks:
+    description: 'JSON array of compliance frameworks to map findings against, e.g. ["hipaa","cmmc"]. Omit for CWE-only output.'
+    required: false
+    default: ''
   poll-interval:
     description: 'Seconds between status polls'
     required: false
@@ -40,7 +44,9 @@ runs:
       run: |
         MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
         git diff "$MERGE_BASE" "$HEAD_SHA" > /tmp/pr.diff
-        echo "Diff size: $(wc -c < /tmp/pr.diff) bytes"
+
+        DIFF_SIZE=$(wc -c < /tmp/pr.diff | tr -d " ")
+        echo "Diff size: ${DIFF_SIZE} bytes"
 
         # Guard: skip analysis if diff is empty (e.g. whitespace-only or metadata-only PR)
         if [ ! -s /tmp/pr.diff ]; then
@@ -48,9 +54,16 @@ runs:
           exit 0
         fi
 
+        # Guard: fail if diff exceeds the 5 MB server-side cap
+        if [ "$DIFF_SIZE" -gt 5242880 ]; then
+          echo "::error::Diff size (${DIFF_SIZE} bytes) exceeds the 5 MB server limit. Please split the PR into smaller changes."
+          exit 1
+        fi
+
         # Collect subject + body per commit, NUL-delimited to safely handle newlines.
         # Each element in the JSON array is one full commit message (subject + blank line + body),
         # with trailing whitespace trimmed. Commits with no body produce subject-only strings.
+        # Server caps at 20 entries in the prompt; rest are collapsed server-side.
         git log "$MERGE_BASE".."$HEAD_SHA" --format="%s%n%n%b%x00" | \
           awk 'BEGIN{RS="\0"} {gsub(/[[:space:]]+$/, ""); if (length > 0) print}' | \
           jq -R . | jq -s . > /tmp/commit_messages.json
@@ -60,6 +73,7 @@ runs:
       shell: bash
       env:
         COMPLIANCE_API_KEY: ${{ inputs.api-key }}
+        FRAMEWORKS: ${{ inputs.frameworks }}
       run: |
         COMMIT_MESSAGES=$(cat /tmp/commit_messages.json)
 
@@ -70,11 +84,19 @@ runs:
           README_ARG=()
         fi
 
+        # Include frameworks only if the input was provided
+        if [ -n "$FRAMEWORKS" ]; then
+          FRAMEWORKS_ARG=(-F "frameworks=$FRAMEWORKS")
+        else
+          FRAMEWORKS_ARG=()
+        fi
+
         curl -sS -X POST \
           -H "Authorization: Bearer $COMPLIANCE_API_KEY" \
           -F "diff=@/tmp/pr.diff;type=text/plain" \
           "${README_ARG[@]}" \
           -F "commit_messages=$COMMIT_MESSAGES" \
+          "${FRAMEWORKS_ARG[@]}" \
           --max-time 120 \
           -o /tmp/submit_response.json \
           "https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check/"
@@ -106,14 +128,25 @@ runs:
             exit 1
           fi
 
-          curl -sS \
+          HTTP_CODE=$(curl -sS \
             -H "Authorization: Bearer $COMPLIANCE_API_KEY" \
             --max-time 30 \
             -o /tmp/poll_response.json \
-            "https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check/jobs/${JOB_ID}"
+            -w "%{http_code}" \
+            "https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check/jobs/${JOB_ID}")
 
-          STATUS=$(jq -r '.status' /tmp/poll_response.json)
-          echo "Attempt $ATTEMPT - status: $STATUS"
+          echo "Attempt $ATTEMPT - HTTP: $HTTP_CODE"
+
+          # Handle 429 rate limit — honour Retry-After from response body
+          if [ "$HTTP_CODE" = "429" ]; then
+            RETRY_AFTER=$(jq -r '.retry_after_seconds // 60' /tmp/poll_response.json)
+            echo "Rate limited. Waiting ${RETRY_AFTER}s before retrying..."
+            sleep "$RETRY_AFTER"
+            continue
+          fi
+
+          STATUS=$(jq -r '.status // "unknown"' /tmp/poll_response.json)
+          echo "status: $STATUS"
 
           case "$STATUS" in
             success)
@@ -129,6 +162,17 @@ runs:
               ;;
             pending|running|queued)
               sleep "$POLL_INTERVAL_SECONDS"
+              ;;
+            unknown)
+              # Handle job_not_found or any response missing a status field
+              ERR=$(jq -r '.error // "unknown error"' /tmp/poll_response.json)
+              if [ "$ERR" = "job_not_found" ]; then
+                echo "::error::Job ${JOB_ID} not found on server."
+                exit 1
+              fi
+              echo "::error::Unexpected response: $ERR"
+              cat /tmp/poll_response.json
+              exit 1
               ;;
             *)
               echo "::error::Unexpected status: $STATUS"
