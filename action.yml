@@ -23,9 +23,9 @@ inputs:
     required: false
     default: '5'
   poll-timeout:
-    description: 'Max seconds to wait for a result'
+    description: 'Max seconds to wait for a result. Large or security-sensitive PRs run a deeper agentic mini-scan (up to ~35 min).'
     required: false
-    default: '1500'
+    default: '2700'
 
 runs:
   using: 'composite'
@@ -43,6 +43,9 @@ runs:
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: |
         MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+        # Persist the merge-base so the submit step can send it as base_sha —
+        # the server keys baseline lookup + delta on (repo_id, base_sha).
+        echo "MERGE_BASE=$MERGE_BASE" >> "$GITHUB_ENV"
         git diff "$MERGE_BASE" "$HEAD_SHA" > /tmp/pr.diff
 
         DIFF_SIZE=$(wc -c < /tmp/pr.diff | tr -d " ")
@@ -74,6 +77,14 @@ runs:
       env:
         COMPLIANCE_API_KEY: ${{ inputs.api-key }}
         FRAMEWORKS: ${{ inputs.frameworks }}
+        # PR metadata — sent as multipart form fields (server reads these);
+        # values injected via env so PR titles with quotes can't break the shell.
+        REPO_ID: ${{ github.repository }}
+        BASE_SHA: ${{ env.MERGE_BASE }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
       run: |
         COMMIT_MESSAGES=$(cat /tmp/commit_messages.json)
 
@@ -97,6 +108,12 @@ runs:
           "${README_ARG[@]}" \
           -F "commit_messages=$COMMIT_MESSAGES" \
           "${FRAMEWORKS_ARG[@]}" \
+          -F "repo_id=$REPO_ID" \
+          -F "base_sha=$BASE_SHA" \
+          -F "head_sha=$HEAD_SHA" \
+          -F "pr_number=$PR_NUMBER" \
+          -F "pr_title=$PR_TITLE" \
+          -F "pr_author=$PR_AUTHOR" \
           --max-time 120 \
           -o /tmp/submit_response.json \
           "https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check/"
