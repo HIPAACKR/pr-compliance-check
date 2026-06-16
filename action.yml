@@ -72,6 +72,25 @@ runs:
           jq -R . | jq -s . > /tmp/commit_messages.json
         echo "Commit messages: $(cat /tmp/commit_messages.json)"
 
+    - name: Package source for the agentic sweep
+      shell: bash
+      run: |
+        # The agentic engine reads the actual code; upload the checked-out HEAD
+        # so it can. Tar from the repo root (entries at top level — the server
+        # extracts to the scan root, no wrapper dir) and exclude VCS/deps/build
+        # to stay under the 100 MB cap. FAST is deprecated: without this (and no
+        # configured codebase reuse) the server returns BLOCKED, not a pass.
+        tar czf /tmp/source.tar.gz \
+          --exclude='.git' --exclude='node_modules' --exclude='vendor' \
+          --exclude='tmp' --exclude='log' --exclude='.bundle' --exclude='*.log' \
+          -C "$GITHUB_WORKSPACE" .
+        SZ=$(wc -c < /tmp/source.tar.gz | tr -d ' ')
+        echo "source.tar.gz: ${SZ} bytes"
+        if [ "$SZ" -gt 104857600 ]; then
+          echo "::error::Source archive ${SZ} bytes exceeds the 100 MB server cap. Add excludes, or use codebase reuse for large repos."
+          exit 1
+        fi
+
     - name: Submit diff to compliance API
       shell: bash
       env:
@@ -105,6 +124,7 @@ runs:
         curl -sS -X POST \
           -H "Authorization: Bearer $COMPLIANCE_API_KEY" \
           -F "diff=@/tmp/pr.diff;type=text/plain" \
+          -F "source=@/tmp/source.tar.gz;type=application/gzip" \
           "${README_ARG[@]}" \
           -F "commit_messages=$COMMIT_MESSAGES" \
           "${FRAMEWORKS_ARG[@]}" \
@@ -114,7 +134,7 @@ runs:
           -F "pr_number=$PR_NUMBER" \
           -F "pr_title=$PR_TITLE" \
           -F "pr_author=$PR_AUTHOR" \
-          --max-time 120 \
+          --max-time 300 \
           -o /tmp/submit_response.json \
           "https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check/"
 
@@ -168,13 +188,15 @@ runs:
           case "$STATUS" in
             success)
               jq -r '.result' /tmp/poll_response.json > /tmp/api_response.md
-              echo "Got result ($(wc -c < /tmp/api_response.md) bytes)"
+              jq -r '.overall_status // "?"' /tmp/poll_response.json > /tmp/overall_status.txt
+              echo "Got result ($(wc -c < /tmp/api_response.md) bytes); verdict: $(cat /tmp/overall_status.txt)"
               break
               ;;
             failed)
               ERR=$(jq -r '.error // "unknown error"' /tmp/poll_response.json)
               printf '## 🔒 Compliance Review\n\n❌ Analysis failed.\n\n```\n%s\n```\n' "$ERR" \
                 > /tmp/api_response.md
+              echo "blocked" > /tmp/overall_status.txt
               break
               ;;
             pending|running|queued)
@@ -212,3 +234,19 @@ runs:
           -H "Accept: application/vnd.github+json" \
           -d "$BODY" \
           "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments"
+
+    - name: Enforce compliance verdict
+      shell: bash
+      run: |
+        # Fail the check on a non-passing verdict so it blocks merge (with
+        # branch protection). FAST is deprecated, so 'blocked' (no source /
+        # codebase reuse, or the sweep failed) fails the check too.
+        V=$(cat /tmp/overall_status.txt 2>/dev/null || echo "?")
+        echo "Compliance verdict: $V"
+        case "$V" in
+          fail|blocked)
+            echo "::error::Compliance check did not pass (verdict: $V)"
+            exit 1 ;;
+          clean|warn) echo "Verdict acceptable." ;;
+          *) echo "::warning::Unknown verdict '$V' — not failing the check." ;;
+        esac
