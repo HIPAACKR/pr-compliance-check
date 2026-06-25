@@ -23,9 +23,9 @@ inputs:
     required: false
     default: '5'
   poll-timeout:
-    description: 'Max seconds to wait for a result. Large or security-sensitive PRs run a deeper agentic mini-scan (up to ~35 min).'
+    description: 'Max seconds to wait for a result. Large or security-sensitive PRs run a deeper agentic sweep that can run well over an hour under shared-GPU contention. NOTE: the server job TTL (COMPLIANCE_PR_JOB_TTL_SECONDS, default 2h) must be >= this value, or a job running past the TTL returns job_not_found mid-poll instead of finishing.'
     required: false
-    default: '2700'
+    default: '10800'
 
 runs:
   using: 'composite'

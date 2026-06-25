@@ -26,7 +26,7 @@ jobs:
 | `github-token` | No | `${{ github.token }}` | Token for posting PR comments |
 | `frameworks` | No | — | JSON array of compliance frameworks to map findings against, e.g. `["hipaa","cmmc"]`. Omit for CWE-only output. |
 | `poll-interval` | No | `5` | Seconds between status polls |
-| `poll-timeout` | No | `2700` | Max seconds to wait for result. Large or security-sensitive PRs run a deeper agentic mini-scan (up to ~35 min). |
+| `poll-timeout` | No | `10800` | Max seconds to wait for result (3h). Large or security-sensitive PRs run a deeper agentic sweep that can run well over an hour under shared-GPU contention. The server job TTL (`COMPLIANCE_PR_JOB_TTL_SECONDS`, default 2h) must be ≥ this value. |
 ## Setup
 1. Obtain your API key from the UbiComply compliance team.
 2. Add it as a repository secret:
