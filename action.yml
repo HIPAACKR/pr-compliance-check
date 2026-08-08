@@ -22,6 +22,14 @@ inputs:
     description: 'Seconds between status polls'
     required: false
     default: '5'
+  source-excludes:
+    description: 'Extra tar exclude globs for the uploaded source archive, comma- or newline-separated (e.g. "public/images/*,docs/*"). Use when a repo trips the 100 MB server cap on assets the scanner does not need. Excluding paths hides them from your own compliance scan — exclude assets, not code.'
+    required: false
+    default: ''
+  max-file-bytes:
+    description: 'Any single tracked file larger than this is left out of the source archive (default 2 MB). Oversized files are not analyzable source — the common case is a Figma-exported .svg carrying a base64 raster. Raise it if your repo has legitimately large source files.'
+    required: false
+    default: '2097152'
   poll-timeout:
     description: 'Max seconds to wait for a result. Large or security-sensitive PRs run a deeper agentic sweep that can run well over an hour under shared-GPU contention. NOTE: the server job TTL (COMPLIANCE_PR_JOB_TTL_SECONDS, default 2h) must be >= this value, or a job running past the TTL returns job_not_found mid-poll instead of finishing.'
     required: false
@@ -91,21 +99,109 @@ runs:
     - name: Package source for the agentic sweep
       if: steps.diff.outputs.skip != 'true'
       shell: bash
+      env:
+        SOURCE_EXCLUDES: ${{ inputs.source-excludes }}
+        MAX_FILE_BYTES: ${{ inputs.max-file-bytes }}
       run: |
         # The agentic engine reads the actual code; upload the checked-out HEAD
-        # so it can. Tar from the repo root (entries at top level — the server
-        # extracts to the scan root, no wrapper dir) and exclude VCS/deps/build
-        # to stay under the 100 MB cap. FAST is deprecated: without this (and no
-        # configured codebase reuse) the server returns BLOCKED, not a pass.
+        # so it can. FAST is deprecated: without this (and no configured codebase
+        # reuse) the server returns BLOCKED, not a pass.
+        #
+        # The member list comes from git, not from the directory. tar has no
+        # concept of .gitignore, so tarring the workspace archives whatever an
+        # earlier workflow step happened to leave on disk (build output, caches,
+        # fixtures). Tracked-only makes that whole class of bloat unreachable
+        # instead of relying on an exclude list to enumerate it.
+        cd "$GITHUB_WORKSPACE"
+
+        # Members the scanner cannot read as source. Two independent rules,
+        # because neither catches the other's case: compiled/packaged binaries
+        # by extension (a vendored apktool.jar is 20 MB and gzip can't touch an
+        # already-compressed archive), and a per-file size cap for oversized
+        # text (Figma exports raster JPEGs base64-embedded inside .svg wrappers,
+        # which routinely weigh 20 MB+ each and are not binary by extension).
+        # .svg is deliberately NOT listed: an SVG can carry <script>, so small
+        # ones stay in scope and only oversized ones fall to the size cap below.
+        BIN_EXT='jar|war|ear|aar|apk|aab|ipa|dex|class|zip|7z|rar|gz|tgz|bz2|xz|zst|iso|dmg|exe|msi|dll|so|dylib|rlib|pyc|pyo|wasm|pdf|psd|ai|sketch|fig|eps|mp4|mov|avi|mkv|webm|mp3|wav|flac|ogg|ttf|otf|woff|woff2|eot|db|sqlite|sqlite3|mdb|dump|bin|pack|idx|node|whl|egg|jasper|png|jpg|jpeg|gif|webp|bmp|tif|tiff|ico|avif|heic'
+        MAX_FILE_BYTES="${MAX_FILE_BYTES:-2097152}"
+
+        # GNU stat on the runner; the BSD form keeps this runnable for local checks.
+        if stat -c '%s' . >/dev/null 2>&1; then
+          _size() { stat -c '%s' "$1"; }
+        else
+          _size() { stat -f '%z' "$1"; }
+        fi
+
+        : > /tmp/source_members.z
+        : > /tmp/source_dropped.txt
+        KEPT=0; DROPPED=0; DROPPED_BYTES=0
+        while IFS= read -r -d '' f; do
+          # Tracked-but-absent (submodule gitlinks, sparse checkouts) — skip quietly.
+          if [ ! -f "$f" ] || [ -L "$f" ]; then
+            continue
+          fi
+          EXT="${f##*.}"
+          REASON=""
+          if printf '%s' "$EXT" | grep -qiE "^(${BIN_EXT})$"; then
+            REASON="binary type .${EXT}"
+          else
+            FSZ=$(_size "$f" 2>/dev/null || echo 0)
+            if [ "$FSZ" -gt "$MAX_FILE_BYTES" ]; then
+              REASON="${FSZ} bytes > per-file cap ${MAX_FILE_BYTES}"
+            fi
+          fi
+          if [ -n "$REASON" ]; then
+            FSZ=${FSZ:-$(_size "$f" 2>/dev/null || echo 0)}
+            printf '%12s  %s  (%s)\n' "$FSZ" "$f" "$REASON" >> /tmp/source_dropped.txt
+            DROPPED=$((DROPPED + 1)); DROPPED_BYTES=$((DROPPED_BYTES + FSZ))
+            unset FSZ
+            continue
+          fi
+          unset FSZ
+          # Keep the ./ prefix so member names stay identical to previous releases.
+          printf './%s\0' "$f" >> /tmp/source_members.z
+          KEPT=$((KEPT + 1))
+        done < <(git ls-files -z)
+
+        # Consumer-supplied extra excludes, one glob per line or comma-separated.
+        EXTRA_ARGS=()
+        if [ -n "$SOURCE_EXCLUDES" ]; then
+          # `|| [ -n "$pat" ]` so the final pattern survives the missing trailing
+          # newline; trim only surrounding blanks, since a glob may contain spaces.
+          while IFS= read -r pat || [ -n "$pat" ]; do
+            pat="${pat#"${pat%%[![:space:]]*}"}"
+            pat="${pat%"${pat##*[![:space:]]}"}"
+            if [ -n "$pat" ]; then
+              EXTRA_ARGS+=(--exclude="$pat")
+              echo "Extra exclude: $pat"
+            fi
+          done < <(printf '%s' "$SOURCE_EXCLUDES" | tr ',' '\n')
+        fi
+
         tar czf /tmp/source.tar.gz \
           --exclude='.git' --exclude='node_modules' --exclude='vendor' \
           --exclude='tmp' --exclude='log' --exclude='.bundle' --exclude='*.log' \
-          -C "$GITHUB_WORKSPACE" .
+          "${EXTRA_ARGS[@]}" \
+          --null -T /tmp/source_members.z
+
         SZ=$(wc -c < /tmp/source.tar.gz | tr -d ' ')
+        echo "Packaged ${KEPT} tracked files; dropped ${DROPPED} unreadable-as-source (${DROPPED_BYTES} bytes)."
         echo "source.tar.gz: ${SZ} bytes"
+
         if [ "$SZ" -gt 104857600 ]; then
-          echo "::error::Source archive ${SZ} bytes exceeds the 100 MB server cap. Add excludes, or use codebase reuse for large repos."
+          # Show what to fix rather than just refusing. Without this the consumer
+          # is told to "add excludes" with no idea which files are the problem.
+          echo "::error::Source archive ${SZ} bytes exceeds the 100 MB server cap."
+          echo "Largest members still in the archive:"
+          tr '\0' '\n' < /tmp/source_members.z | sed 's|^\./||' | while IFS= read -r f; do
+            [ -f "$f" ] && printf '%12s  %s\n' "$(_size "$f")" "$f"
+          done | sort -rn | head -25
+          echo "Set the 'source-excludes' input to drop these, or lower 'max-file-bytes' (currently ${MAX_FILE_BYTES})."
           exit 1
+        fi
+
+        if [ "$SZ" -gt 83886080 ]; then
+          echo "::warning::Source archive is ${SZ} bytes — over 80% of the 100 MB cap. Consider trimming large assets before it starts failing."
         fi
 
     - name: Submit diff to compliance API
