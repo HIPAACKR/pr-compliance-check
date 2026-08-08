@@ -37,6 +37,7 @@ runs:
         ref: ${{ github.event.pull_request.head.sha }}
 
     - name: Generate diff and collect commit messages
+      id: diff
       shell: bash
       env:
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -51,11 +52,26 @@ runs:
         DIFF_SIZE=$(wc -c < /tmp/pr.diff | tr -d " ")
         echo "Diff size: ${DIFF_SIZE} bytes"
 
-        # Guard: skip analysis if diff is empty (e.g. whitespace-only or metadata-only PR)
-        if [ ! -s /tmp/pr.diff ]; then
-          echo "Empty diff — nothing to analyze."
+        # Guard: skip analysis when the PR changes no substantive content.
+        # An empty /tmp/pr.diff is the wrong test on its own — a whitespace-only
+        # PR still produces a non-empty diff. Count changed lines with whitespace
+        # and blank-line changes ignored instead. numstat prints "-" for binary
+        # files, which always count as substantive; pure renames and mode changes
+        # score 0 and are treated as metadata-only.
+        CHANGED_LINES=$(git diff --ignore-all-space --ignore-blank-lines --numstat \
+          "$MERGE_BASE" "$HEAD_SHA" \
+          | awk -F'\t' '{ if ($1 == "-" || $2 == "-") { n += 1 } else { n += $1 + $2 } } END { print n + 0 }')
+        echo "Substantive changed lines: ${CHANGED_LINES}"
+
+        # Every later step is gated on this output. Exiting 0 here only ends this
+        # step — without the gate the rest of the action runs on inputs that were
+        # never produced and the check goes red instead of skipping cleanly.
+        if [ "$CHANGED_LINES" -eq 0 ]; then
+          echo "::notice::No substantive changes (whitespace-only, metadata-only, or net-empty PR) — skipping compliance analysis."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
           exit 0
         fi
+        echo "skip=false" >> "$GITHUB_OUTPUT"
 
         # Guard: fail if diff exceeds the 5 MB server-side cap
         if [ "$DIFF_SIZE" -gt 5242880 ]; then
@@ -73,6 +89,7 @@ runs:
         echo "Commit messages: $(cat /tmp/commit_messages.json)"
 
     - name: Package source for the agentic sweep
+      if: steps.diff.outputs.skip != 'true'
       shell: bash
       run: |
         # The agentic engine reads the actual code; upload the checked-out HEAD
@@ -92,6 +109,7 @@ runs:
         fi
 
     - name: Submit diff to compliance API
+      if: steps.diff.outputs.skip != 'true'
       shell: bash
       env:
         COMPLIANCE_API_KEY: ${{ inputs.api-key }}
@@ -121,26 +139,59 @@ runs:
           FRAMEWORKS_ARG=()
         fi
 
-        curl -sS -X POST \
-          -H "Authorization: Bearer $COMPLIANCE_API_KEY" \
-          -F "diff=@/tmp/pr.diff;type=text/plain" \
-          -F "source=@/tmp/source.tar.gz;type=application/gzip" \
-          "${README_ARG[@]}" \
-          -F "commit_messages=$COMMIT_MESSAGES" \
-          "${FRAMEWORKS_ARG[@]}" \
-          -F "repo_id=$REPO_ID" \
-          -F "base_sha=$BASE_SHA" \
-          -F "head_sha=$HEAD_SHA" \
-          -F "pr_number=$PR_NUMBER" \
-          -F "pr_title=$PR_TITLE" \
-          -F "pr_author=$PR_AUTHOR" \
-          --max-time 300 \
-          -o /tmp/submit_response.json \
-          "https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check/"
+        # Submit is rate-limited per consumer just like the status endpoint, so it
+        # has to honour 429/retry_after_seconds too — otherwise a rate-limited
+        # submit just falls through to the missing-job_id error below.
+        SUBMIT_MAX_ATTEMPTS=5
+        SUBMIT_ATTEMPT=0
+        while :; do
+          SUBMIT_ATTEMPT=$((SUBMIT_ATTEMPT + 1))
 
-        JOB_ID=$(jq -r '.job_id' /tmp/submit_response.json)
+          HTTP_CODE=$(curl -sS -X POST \
+            -H "Authorization: Bearer $COMPLIANCE_API_KEY" \
+            -F "diff=@/tmp/pr.diff;type=text/plain" \
+            -F "source=@/tmp/source.tar.gz;type=application/gzip" \
+            "${README_ARG[@]}" \
+            -F "commit_messages=$COMMIT_MESSAGES" \
+            "${FRAMEWORKS_ARG[@]}" \
+            -F "repo_id=$REPO_ID" \
+            -F "base_sha=$BASE_SHA" \
+            -F "head_sha=$HEAD_SHA" \
+            -F "pr_number=$PR_NUMBER" \
+            -F "pr_title=$PR_TITLE" \
+            -F "pr_author=$PR_AUTHOR" \
+            --max-time 300 \
+            -o /tmp/submit_response.json \
+            -w "%{http_code}" \
+            "https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check/")
+
+          echo "Submit attempt $SUBMIT_ATTEMPT - HTTP: $HTTP_CODE"
+          if [ "$HTTP_CODE" != "429" ]; then
+            break
+          fi
+
+          if [ "$SUBMIT_ATTEMPT" -ge "$SUBMIT_MAX_ATTEMPTS" ]; then
+            echo "::error::Submit rate-limited (HTTP 429) after ${SUBMIT_ATTEMPT} attempts."
+            cat /tmp/submit_response.json
+            exit 1
+          fi
+
+          # A gateway-level 429 has no JSON body, so this parse must never abort
+          # the step; fall back to 60s and cap the server-supplied value.
+          RETRY_AFTER=$(jq -r '.retry_after_seconds // empty' /tmp/submit_response.json 2>/dev/null || true)
+          case "$RETRY_AFTER" in
+            ''|*[!0-9]*) RETRY_AFTER=60 ;;
+          esac
+          if [ "$RETRY_AFTER" -gt 300 ]; then
+            RETRY_AFTER=300
+          fi
+          echo "Rate limited on submit. Waiting ${RETRY_AFTER}s before retrying..."
+          sleep "$RETRY_AFTER"
+        done
+
+        JOB_ID=$(jq -r '.job_id // empty' /tmp/submit_response.json 2>/dev/null || true)
         if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "null" ]; then
-          echo "::error::Submit did not return a job_id"
+          echo "::error::Submit did not return a job_id (HTTP ${HTTP_CODE})"
           cat /tmp/submit_response.json
           exit 1
         fi
@@ -148,6 +199,7 @@ runs:
         echo "Submitted job: $JOB_ID"
 
     - name: Poll for result
+      if: steps.diff.outputs.skip != 'true'
       shell: bash
       env:
         COMPLIANCE_API_KEY: ${{ inputs.api-key }}
@@ -174,9 +226,17 @@ runs:
 
           echo "Attempt $ATTEMPT - HTTP: $HTTP_CODE"
 
-          # Handle 429 rate limit — honour Retry-After from response body
+          # Handle 429 rate limit — honour Retry-After from response body.
+          # A gateway-level 429 has no JSON body, so this parse must never abort
+          # the step; fall back to 60s and cap the server-supplied value.
           if [ "$HTTP_CODE" = "429" ]; then
-            RETRY_AFTER=$(jq -r '.retry_after_seconds // 60' /tmp/poll_response.json)
+            RETRY_AFTER=$(jq -r '.retry_after_seconds // empty' /tmp/poll_response.json 2>/dev/null || true)
+            case "$RETRY_AFTER" in
+              ''|*[!0-9]*) RETRY_AFTER=60 ;;
+            esac
+            if [ "$RETRY_AFTER" -gt 300 ]; then
+              RETRY_AFTER=300
+            fi
             echo "Rate limited. Waiting ${RETRY_AFTER}s before retrying..."
             sleep "$RETRY_AFTER"
             continue
@@ -222,6 +282,7 @@ runs:
         done
 
     - name: Post comment on PR
+      if: steps.diff.outputs.skip != 'true'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
@@ -236,6 +297,7 @@ runs:
           "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments"
 
     - name: Enforce compliance verdict
+      if: steps.diff.outputs.skip != 'true'
       shell: bash
       run: |
         # Fail the check on a non-passing verdict so it blocks merge (with

@@ -14,7 +14,7 @@ jobs:
   compliance-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: HIPAACKR/pr-compliance-check@v1.2
+      - uses: HIPAACKR/pr-compliance-check@v1.3
         with:
           api-key: ${{ secrets.COMPLIANCE_API_KEY }}
           frameworks: '["hipaa","cmmc"]'
@@ -35,6 +35,7 @@ jobs:
 4. **Codebase-reuse / THOROUGH mode** requires a per-tenant PAT as `COMPLIANCE_API_KEY`. The shared global key resolves to a shared identity that the server refuses for codebase reuse. Use the per-tenant key minted at auth.ubicomply.ai, or a per-tenant key from the compliance team.
 That's it — every PR will now be reviewed automatically.
 ## How It Works
+0. Skips the analysis entirely — leaving the check green — when the PR changes no substantive content. Whitespace-only, blank-line-only, metadata-only (pure rename or mode change), and net-empty PRs all qualify; binary changes never do. Nothing is submitted and no comment is posted.
 1. Collects the PR diff and full commit messages (subject + body).
 2. Submits them to the UbiComply compliance analysis API. If a `README.md` exists in the repo root, it is included as project context for the agent. If `frameworks` is provided, findings are mapped to the requested compliance controls.
 3. Polls until the analysis is complete.
