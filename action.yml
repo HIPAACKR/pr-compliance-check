@@ -219,7 +219,28 @@ runs:
         PR_TITLE: ${{ github.event.pull_request.title }}
         PR_AUTHOR: ${{ github.event.pull_request.user.login }}
       run: |
+        # Strip CR/LF and surrounding blanks from the key. A secret pasted with
+        # a trailing newline puts a bare LF inside the Authorization header
+        # value; the LF then reads as a header-line terminator and the CRLF
+        # after it as the blank line ending the header block. curl's remaining
+        # headers — Content-Length and Content-Type — land in the BODY, the
+        # server never sees a multipart content type, and the source archive is
+        # silently dropped. The request still authenticates, so it surfaces as a
+        # BLOCKED verdict rather than an auth error. Cheap to prevent here.
+        COMPLIANCE_API_KEY="$(printf '%s' "$COMPLIANCE_API_KEY" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        if [ -z "$COMPLIANCE_API_KEY" ]; then
+          echo "::error::api-key is empty after trimming whitespace."
+          exit 1
+        fi
+
         COMMIT_MESSAGES=$(cat /tmp/commit_messages.json)
+
+        # The archive must exist and be non-empty, or curl silently posts a
+        # request the server cannot use.
+        if [ ! -s /tmp/source.tar.gz ]; then
+          echo "::error::/tmp/source.tar.gz is missing or empty — refusing to submit."
+          exit 1
+        fi
 
         # Include README only if it exists in the repo root
         if [ -f README.md ]; then
@@ -302,6 +323,9 @@ runs:
         POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval }}
         POLL_TIMEOUT_SECONDS: ${{ inputs.poll-timeout }}
       run: |
+        # Same trim as the submit step — see the note there.
+        COMPLIANCE_API_KEY="$(printf '%s' "$COMPLIANCE_API_KEY" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
         JOB_ID=$(cat /tmp/job_id.txt)
 
         DEADLINE=$(( $(date +%s) + POLL_TIMEOUT_SECONDS ))

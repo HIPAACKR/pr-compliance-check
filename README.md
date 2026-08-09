@@ -14,7 +14,7 @@ jobs:
   compliance-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: HIPAACKR/pr-compliance-check@v1.4
+      - uses: HIPAACKR/pr-compliance-check@v1.5
         with:
           api-key: ${{ secrets.COMPLIANCE_API_KEY }}
           frameworks: '["hipaa","cmmc"]'
