@@ -4,6 +4,8 @@
 
 Automatically analyzes pull request diffs for compliance and posts the results as a PR comment.
 
+📋 [View Release Notes](https://github.com/HIPAACKR/pr-compliance-check/releases/tag/v1.5)
+
 ## Supported frameworks & languages
 
 Analysis support is currently tuned for the following application frameworks:
