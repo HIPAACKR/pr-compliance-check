@@ -30,6 +30,10 @@ inputs:
     description: 'Any single tracked file larger than this is left out of the source archive (default 2 MB). Oversized files are not analyzable source — the common case is a Figma-exported .svg carrying a base64 raster. Raise it if your repo has legitimately large source files.'
     required: false
     default: '2097152'
+  publish-check-run:
+    description: 'Also publish the result as a named "Compliance Check" check with inline annotations on the changed lines. Needs `checks: write` in the workflow permissions; without it the step only warns. Set to false to keep just the PR comment.'
+    required: false
+    default: 'true'
   poll-timeout:
     description: 'Max seconds to wait for a result. Large or security-sensitive PRs run a deeper agentic sweep that can run well over an hour under shared-GPU contention. NOTE: the server job TTL (COMPLIANCE_PR_JOB_TTL_SECONDS, default 2h) must be >= this value, or a job running past the TTL returns job_not_found mid-poll instead of finishing.'
     required: false
@@ -369,6 +373,10 @@ runs:
             success)
               jq -r '.result' /tmp/poll_response.json > /tmp/api_response.md
               jq -r '.overall_status // "?"' /tmp/poll_response.json > /tmp/overall_status.txt
+              # Named check + annotations (C2.9). Absent on older servers;
+              # the publish step then skips.
+              jq -c '.check_run // empty' /tmp/poll_response.json > /tmp/check_run.json
+              jq -r '(.annotations // [])[]' /tmp/poll_response.json > /tmp/annotations.txt
               echo "Got result ($(wc -c < /tmp/api_response.md) bytes); verdict: $(cat /tmp/overall_status.txt)"
               break
               ;;
@@ -415,6 +423,17 @@ runs:
           -H "Accept: application/vnd.github+json" \
           -d "$BODY" \
           "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments"
+
+    - name: Publish check run and annotations
+      if: steps.diff.outputs.skip != 'true' && inputs.publish-check-run == 'true'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      # Never decides the job: every failure is a warning and the script
+      # exits 0. The next step enforces the verdict exactly as before.
+      run: bash "${{ github.action_path }}/scripts/publish-check-run.sh" /tmp/check_run.json /tmp/annotations.txt
 
     - name: Enforce compliance verdict
       if: steps.diff.outputs.skip != 'true'

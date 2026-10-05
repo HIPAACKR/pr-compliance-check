@@ -33,6 +33,7 @@ on:
 permissions:
   pull-requests: write
   contents: read
+  checks: write
 jobs:
   compliance-check:
     runs-on: ubuntu-latest
@@ -53,6 +54,7 @@ jobs:
 | `github-token` | No | `${{ github.token }}` | Token for posting PR comments |
 | `frameworks` | No | — | JSON array of compliance frameworks to map findings against, e.g. `["hipaa","cmmc"]`. Omit for CWE-only output. |
 | `poll-interval` | No | `5` | Seconds between status polls |
+| `publish-check-run` | No | `true` | Also publish the result as a named **Compliance Check** check with inline annotations on the changed lines. Needs `checks: write` (see Quick Start); without it the step only logs a warning. Set to `false` to keep just the PR comment. |
 | `source-excludes` | No | — | Extra tar exclude globs for the uploaded source archive, comma- or newline-separated (e.g. `public/images/*,docs/*`). Use when a repo trips the 100 MB cap on assets the scanner doesn't need. Excluding paths hides them from your own compliance scan — exclude assets, not code. |
 | `max-file-bytes` | No | `2097152` | Any single tracked file larger than this is left out of the source archive. Oversized files aren't analyzable source; the usual culprit is a Figma-exported `.svg` carrying a base64 raster. Raise it if your repo has legitimately large source files. |
 | `poll-timeout` | No | `10800` | Max seconds to wait for result (3h). Large or security-sensitive PRs run a deeper agentic sweep that can run well over an hour under shared-GPU contention. The server job TTL (`COMPLIANCE_PR_JOB_TTL_SECONDS`, default 2h) must be ≥ this value. |
@@ -74,6 +76,8 @@ That's it — every PR will now be reviewed automatically.
 3. Submits them to the UbiComply compliance analysis API. If a `README.md` exists in the repo root, it is included as project context for the agent. If `frameworks` is provided, findings are mapped to the requested compliance controls.
 4. Polls until the analysis is complete.
 5. Posts the result as a comment on the PR.
+6. Publishes the same result as a named **Compliance Check** check, with the report in its details and up to 50 findings as inline annotations on the changed lines (`publish-check-run`). GitHub shows at most 10 error and 10 warning annotations per step inline; the rest are in the check's summary. Publishing never changes the verdict.
+7. Fails the job on a `fail` or `blocked` verdict, so it can block the merge with branch protection.
 
 ## Disclaimer
 
