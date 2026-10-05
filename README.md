@@ -57,7 +57,7 @@ jobs:
 | `publish-check-run` | No | `true` | Also publish the result as a named **Compliance Check** check with inline annotations on the changed lines. Needs `checks: write` (see Quick Start); without it the step only logs a warning. Set to `false` to keep just the PR comment. |
 | `source-excludes` | No | — | Extra tar exclude globs for the uploaded source archive, comma- or newline-separated (e.g. `public/images/*,docs/*`). Use when a repo trips the 100 MB cap on assets the scanner doesn't need. Excluding paths hides them from your own compliance scan — exclude assets, not code. |
 | `max-file-bytes` | No | `2097152` | Any single tracked file larger than this is left out of the source archive. Oversized files aren't analyzable source; the usual culprit is a Figma-exported `.svg` carrying a base64 raster. Raise it if your repo has legitimately large source files. |
-| `poll-timeout` | No | `10800` | Max seconds to wait for result (3h). Large or security-sensitive PRs run a deeper agentic sweep that can run well over an hour under shared-GPU contention. The server job TTL (`COMPLIANCE_PR_JOB_TTL_SECONDS`, default 2h) must be ≥ this value. |
+| `poll-timeout` | No | `10800` | Max seconds to wait for result (3h). Large or security-sensitive PRs run a deeper agentic sweep that can run well over an hour under shared-GPU contention. The server job TTL (`COMPLIANCE_PR_JOB_TTL_SECONDS`, default 3h15m and never lower; the server raises any smaller value to that floor) must be ≥ this value. Raising `poll-timeout` above 3h15m needs the server TTL raised to match. |
 
 ## Setup
 
