@@ -77,7 +77,7 @@ That's it — every PR will now be reviewed automatically.
 4. Polls until the analysis is complete.
 5. Posts the result as a comment on the PR.
 6. Publishes the same result as a named **Compliance Check** check, with the report in its details and up to 50 findings as inline annotations on the changed lines (`publish-check-run`). GitHub shows at most 10 error and 10 warning annotations per step inline; the rest are in the check's summary. Publishing never changes the verdict.
-7. Fails the job on a `fail` or `blocked` verdict, so it can block the merge with branch protection.
+7. Fails the job unless the verdict is `clean` or `warn`, so it can block the merge with branch protection. A `fail` or `blocked` verdict fails it, and so does a result with no verdict or one the action does not know. Earlier releases passed those last two with a warning.
 
 ## Disclaimer
 

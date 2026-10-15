@@ -372,7 +372,9 @@ runs:
           case "$STATUS" in
             success)
               jq -r '.result' /tmp/poll_response.json > /tmp/api_response.md
-              jq -r '.overall_status // "?"' /tmp/poll_response.json > /tmp/overall_status.txt
+              # No "?" placeholder: an absent verdict stays empty, and the
+              # enforce step fails the check on it (T04).
+              jq -r '.overall_status // ""' /tmp/poll_response.json > /tmp/overall_status.txt
               # Named check + annotations (C2.9). Absent on older servers;
               # the publish step then skips.
               jq -c '.check_run // empty' /tmp/poll_response.json > /tmp/check_run.json
@@ -438,16 +440,7 @@ runs:
     - name: Enforce compliance verdict
       if: steps.diff.outputs.skip != 'true'
       shell: bash
-      run: |
-        # Fail the check on a non-passing verdict so it blocks merge (with
-        # branch protection). FAST is deprecated, so 'blocked' (no source /
-        # codebase reuse, or the sweep failed) fails the check too.
-        V=$(cat /tmp/overall_status.txt 2>/dev/null || echo "?")
-        echo "Compliance verdict: $V"
-        case "$V" in
-          fail|blocked)
-            echo "::error::Compliance check did not pass (verdict: $V)"
-            exit 1 ;;
-          clean|warn) echo "Verdict acceptable." ;;
-          *) echo "::warning::Unknown verdict '$V' — not failing the check." ;;
-        esac
+      # Fails closed: only clean and warn pass. fail, blocked (the analysis
+      # could not run), a missing verdict and an unknown one all fail the
+      # check, so it blocks the merge with branch protection.
+      run: bash "${{ github.action_path }}/scripts/enforce-verdict.sh" /tmp/overall_status.txt
