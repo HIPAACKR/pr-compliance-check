@@ -1,10 +1,10 @@
 # 🔒 Compliance Check Action
 
-**Status:** Pre-release / Beta (v1.5) — feedback welcome before General Availability
+**Status:** Pre-release / Beta (v1.6) — feedback welcome before General Availability
 
 Automatically analyzes pull request diffs for compliance and posts the results as a PR comment.
 
-📋 [View Release Notes](https://github.com/HIPAACKR/pr-compliance-check/releases/tag/v1.5)
+📋 [View Release Notes](https://github.com/HIPAACKR/pr-compliance-check/releases/tag/v1.6)
 
 ## Supported frameworks & languages
 
@@ -38,7 +38,7 @@ jobs:
   compliance-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: HIPAACKR/pr-compliance-check@v1.5
+      - uses: HIPAACKR/pr-compliance-check@v1.6
         with:
           api-key: ${{ secrets.COMPLIANCE_API_KEY }}
           frameworks: '["hipaa"]'
