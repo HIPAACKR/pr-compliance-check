@@ -4,7 +4,7 @@
 
 Analyzes pull request diffs for compliance and posts the results as a PR comment.
 
-📋 [View Release Notes](https://github.com/HIPAACKR/pr-compliance-check/releases/tag/v1.6) · [v1.7 notes](docs/RELEASE_NOTES_v1.7.md)
+📋 [View Release Notes](https://github.com/HIPAACKR/pr-compliance-check/releases/tag/v1.7)
 
 ## Supported frameworks & languages
 
@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 210
     steps:
-      - uses: HIPAACKR/pr-compliance-check@v1.6
+      - uses: HIPAACKR/pr-compliance-check@v1.7
         with:
           api-key: ${{ secrets.COMPLIANCE_API_KEY }}
           frameworks: '["hipaa"]'

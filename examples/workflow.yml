@@ -6,11 +6,19 @@ permissions:
   pull-requests: write
   contents: read
   checks: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 jobs:
   compliance-check:
     runs-on: ubuntu-latest
+    # poll-timeout / 60 + 30
+    timeout-minutes: 210
     steps:
-      - uses: HIPAACKR/pr-compliance-check@v1.6
+      - uses: HIPAACKR/pr-compliance-check@v1.7
         with:
           api-key: ${{ secrets.COMPLIANCE_API_KEY }}
-          frameworks: '["hipaa","cmmc"]'
+          # One framework per job.
+          frameworks: '["hipaa"]'
+          # hard (default), verdict-only or advisory.
+          enforce: hard
