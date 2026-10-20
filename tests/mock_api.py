@@ -175,6 +175,9 @@ def status_scenario(scn: str, n: int) -> tuple[int, dict, object]:
         return 404, {}, {"error": "job_not_found"}
     if scn == "queued_forever":
         return 200, {}, {**PENDING_QUEUED, "queued_seconds": 100 * n + 0.9}
+    if scn == "queued_server_limit":
+        # The server echoes its clamped max_queue (100 s): give up past 400 s.
+        return 200, {}, {**PENDING_QUEUED, "queued_seconds": 100 * n + 0.9, "max_queue": 100}
     if scn == "stale_heartbeat":
         return 200, {}, {**PENDING_RUNNING, "heartbeat_age_seconds": 1300.9}
     if scn == "heartbeat_edge":

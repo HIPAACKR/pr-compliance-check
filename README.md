@@ -163,7 +163,7 @@ When the action gives up on a job that may still be running (`poll_timeout`, `qu
 | Submit | connection errors, 5xx, 404, 408, a 2xx without a job id: up to 6 attempts with back-off (5, 10, 20, 40, 60 s). 429 and 503 wait for `Retry-After` (capped at 300 s). | 400 and other 4xx (`submit_rejected`), 401/403 (`auth_failed`), 413 (`diff_too_large` or `source_too_large`) |
 | Poll | connection errors, 5xx, HTML or unreadable 200s, unknown status values: up to 20 in a row with back-off. 429 waits for `Retry-After`. 404 up to 6 times right after submit, 3 times later. | 401/403 (`auth_failed`) |
 
-Every response's HTTP status is checked. While the job runs the action reads `state`, `queued_seconds` and `heartbeat_age_seconds` (whole seconds, floored) and gives up early when the job sits in the queue past `max-queue` + 300 s or its heartbeat is older than 1,200 s. Servers that send only `{"status": "pending"}` are polled exactly as v1.6 did, until `poll-timeout`.
+Every response's HTTP status is checked. While the job runs the action reads `state`, `queued_seconds` and `heartbeat_age_seconds` (whole seconds, floored) and gives up early when the job sits in the queue past its queue limit plus 300 s (the server's clamped `max_queue` when the status carries it, else `max-queue`) or its heartbeat is older than 1,200 s. Servers that send only `{"status": "pending"}` are polled exactly as v1.6 did, until `poll-timeout`.
 
 ## Fork pull requests
 

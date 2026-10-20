@@ -9,8 +9,9 @@
 #   POLL_TIMEOUT_SECONDS   give up after this long (default 10800)
 #   MAX_QUEUE_SECONDS      the max_queue sent on submit (default: timeout - 3600)
 #   QUEUE_GIVE_UP_SECONDS  give up when queued longer than this
-#                          (default MAX_QUEUE_SECONDS + 300; the server should
-#                          expire the job first)
+#                          (default: the server's clamped max_queue when the
+#                          status carries it, else MAX_QUEUE_SECONDS, plus
+#                          300; the server should expire the job first)
 #   STALL_SECONDS          give up when the running job's heartbeat is older
 #                          than this (default 1200; the server says
 #                          worker_lost at 900)
@@ -265,6 +266,10 @@ while :; do
   fi
   HB=$(num heartbeat_age_seconds)
   QS=$(num queued_seconds)
+  SMQ=$(num max_queue)
+  if [ -z "${QUEUE_GIVE_UP_SECONDS:-}" ] && [ -n "$SMQ" ]; then
+    QUEUE_LIMIT=$((SMQ + 300))
+  fi
   RS=$(num running_seconds)
   PHASE=$(jq -r '.phase // "" | strings' "$RESP" 2>/dev/null | cut -c1-40 || true)
   DETAIL=""

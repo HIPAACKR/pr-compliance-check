@@ -231,6 +231,11 @@ check "poll: queue_expired names the wait" has "$OUT/api_response.md" "waited 30
 check "poll: queue_expired asks the server to cancel" eq "$(n_requests "/s/queued_forever/r$RUN/jobs/job-queued_forever-0001/cancel")" 1
 
 new_run
+poll queued_server_limit
+check "poll: the server's echoed max_queue sets the queue limit" gave_up queue_expired
+check "poll: echoed max_queue plus 300 s" has "$OUT/api_response.md" "waited 400s"
+
+new_run
 poll stale_heartbeat
 check "poll: stale heartbeat gives up as worker_lost" gave_up worker_lost
 check "poll: heartbeat age is floored (1300.9 -> 1300)" has "$OUT/api_response.md" "1300s ago"
