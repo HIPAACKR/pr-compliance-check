@@ -7,6 +7,10 @@
 #        REPO          owner/name
 #        HEAD_SHA      the PR head commit, used when the body has no head_sha
 #        GITHUB_API_URL  optional, defaults to https://api.github.com
+#        ENFORCE       hard (default) | verdict-only | advisory. Under
+#                      verdict-only and advisory a "failure" conclusion is
+#                      published as "neutral", so the named check never blocks
+#                      a merge the enforce mode would let through.
 #
 # Both inputs come from the compliance API's job result. Either may be missing
 # or empty (an older server, or a failed analysis); that is not an error.
@@ -48,8 +52,21 @@ if [ -z "$CHECK_FILE" ] || [ ! -s "$CHECK_FILE" ]; then
   exit 0
 fi
 
-if ! BODY=$(jq -c --arg sha "${HEAD_SHA:-}" \
-    'if (.head_sha // "") == "" then .head_sha = $sha else . end' "$CHECK_FILE" 2>/dev/null); then
+MODE=$(printf '%s' "${ENFORCE:-hard}" | tr -d '\r\n' | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+case "$MODE" in
+  verdict-only | advisory) ;;
+  *) MODE=hard ;;
+esac
+
+if ! BODY=$(jq -c --arg sha "${HEAD_SHA:-}" --arg mode "$MODE" '
+    (if (.head_sha // "") == "" then .head_sha = $sha else . end)
+    | if $mode != "hard" and .conclusion == "failure" then
+        .conclusion = "neutral"
+        | ("**enforce: " + $mode + "**. The compliance verdict did not pass. This named check is shown as neutral; the enforce mode decides whether the workflow job fails.\n\n") as $note
+        | if (.output | type) == "object" and (((.output.summary // "") | length) + ($note | length)) <= 65535
+          then .output.summary = $note + (.output.summary // "")
+          else . end
+      else . end' "$CHECK_FILE" 2>/dev/null); then
   echo "::warning::The check-run body from the compliance API was not valid JSON; skipping the named check."
   exit 0
 fi

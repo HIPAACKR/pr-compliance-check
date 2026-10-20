@@ -106,6 +106,28 @@ run "" "$WORK/crlf.txt"
 check "CRLF line printed without CR" "$(grep -qx '::error file=a.py,line=1::one' "$WORK/out"; echo $?)"
 check "CRLF ::add-mask:: still dropped" "$(! grep -q '^::add-mask::' "$WORK/out"; echo $?)"
 
+# 9. Enforce modes: verdict-only and advisory publish a failure as neutral.
+ENFORCE=advisory STUB_CODE=201 run "$WORK/check.json" ""
+check "advisory publishes failure as neutral" "$([ "$(jq -r .conclusion "$WORK/stdin.json")" = neutral ]; echo $?)"
+check "advisory notes the rewrite in the summary" "$(jq -r .output.summary "$WORK/stdin.json" | grep -q '^\*\*enforce: advisory\*\*'; echo $?)"
+check "advisory keeps the server summary" "$(jq -r .output.summary "$WORK/stdin.json" | grep -qx 's'; echo $?)"
+ENFORCE=verdict-only STUB_CODE=201 run "$WORK/check.json" ""
+check "verdict-only publishes failure as neutral" "$([ "$(jq -r .conclusion "$WORK/stdin.json")" = neutral ]; echo $?)"
+ENFORCE=hard STUB_CODE=201 run "$WORK/check.json" ""
+check "hard keeps failure" "$([ "$(jq -r .conclusion "$WORK/stdin.json")" = failure ]; echo $?)"
+check "hard leaves the summary alone" "$([ "$(jq -r .output.summary "$WORK/stdin.json")" = s ]; echo $?)"
+STUB_CODE=201 run "$WORK/check.json" ""
+check "no ENFORCE keeps failure (v1.6)" "$([ "$(jq -r .conclusion "$WORK/stdin.json")" = failure ]; echo $?)"
+ENFORCE=bogus STUB_CODE=201 run "$WORK/check.json" ""
+check "unknown ENFORCE keeps failure" "$([ "$(jq -r .conclusion "$WORK/stdin.json")" = failure ]; echo $?)"
+printf '%s' "${BODY/\"conclusion\":\"failure\"/\"conclusion\":\"success\"}" > "$WORK/ok.json"
+ENFORCE=advisory STUB_CODE=201 run "$WORK/ok.json" ""
+check "advisory leaves success alone" "$([ "$(jq -r .conclusion "$WORK/stdin.json")" = success ]; echo $?)"
+printf '{"name":"Compliance Check","head_sha":"x","status":"completed","conclusion":"failure"}' > "$WORK/nooutput.json"
+ENFORCE=advisory STUB_CODE=201 run "$WORK/nooutput.json" ""
+check "advisory without output still neutral" "$([ "$(jq -r .conclusion "$WORK/stdin.json")" = neutral ]; echo $?)"
+check "advisory without output adds no output" "$([ "$(jq -r '.output == null' "$WORK/stdin.json")" = true ]; echo $?)"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
