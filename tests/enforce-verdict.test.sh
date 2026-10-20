@@ -80,18 +80,24 @@ check_extracted "NUL after verdict"          '{"status":"success","result":"x","
 check_extracted "false verdict"              '{"status":"success","result":"x","overall_status":false}' 1
 check_extracted "numeric verdict"            '{"status":"success","result":"x","overall_status":1}' 1
 
-# action.yml itself must use this extraction and this script, so a revert to
-# the old inline case (which only warned) or a "?"/"clean" default fails here.
+# The poll script and action.yml must use this extraction and this script, so
+# a revert to the old inline case (which only warned) or a "?"/"clean" default
+# fails here.
 ACTION="$HERE/../action.yml"
+POLL="$HERE/../scripts/poll-job.sh"
 pin() {
-  local name="$1" needle="$2"
-  if grep -qF -- "$needle" "$ACTION"; then echo "ok    $name"; PASS=$((PASS + 1))
-  else echo "FAIL  $name: action.yml lacks: $needle"; FAIL=$((FAIL + 1)); fi
+  local name="$1" file="$2" needle="$3"
+  if grep -qF -- "$needle" "$file"; then echo "ok    $name"; PASS=$((PASS + 1))
+  else echo "FAIL  $name: ${file##*/} lacks: $needle"; FAIL=$((FAIL + 1)); fi
 }
-pin "action.yml extracts with an empty default" \
-  "jq -r '.overall_status // \"\"' /tmp/poll_response.json > /tmp/overall_status.txt"
-pin "action.yml enforces with the script" \
-  'run: bash "${{ github.action_path }}/scripts/enforce-verdict.sh" /tmp/overall_status.txt'
+pin "poll-job.sh extracts with an empty default" "$POLL" \
+  "jq -r '.overall_status // \"\"' \"\$RESP\" > \"\$OUT_DIR/overall_status.txt\""
+pin "action.yml runs the poll script" "$ACTION" \
+  'run: bash "${{ github.action_path }}/scripts/poll-job.sh"'
+pin "action.yml enforces with the script" "$ACTION" \
+  'run: bash "${{ github.action_path }}/scripts/enforce-verdict.sh" /tmp/overall_status.txt /tmp/outcome.txt /tmp/assessment.txt'
+pin "action.yml defaults enforce to hard (v1.6 behaviour)" "$ACTION" \
+  "    default: 'hard'"
 if grep -qF "not failing the check" "$ACTION"; then
   echo "FAIL  action.yml still has a warn-only verdict branch"; FAIL=$((FAIL + 1))
 else

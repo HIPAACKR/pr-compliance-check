@@ -23,11 +23,11 @@ inputs:
     required: false
     default: '5'
   source-excludes:
-    description: 'Extra tar exclude globs for the uploaded source archive, comma- or newline-separated (e.g. "public/images/*,docs/*"). Use when a repo trips the 100 MB server cap on assets the scanner does not need. Excluding paths hides them from your own compliance scan — exclude assets, not code.'
+    description: 'Extra tar exclude globs for the uploaded source archive, comma- or newline-separated (e.g. "public/images/*,docs/*"). Use when a repo trips the 100 MB server cap on assets the scanner does not need. Excluding paths hides them from your own compliance scan, so exclude assets, not code. .env, .env.*, *.pem, *.key, *.p12, *.pfx, *.jks and *.keystore are always left out.'
     required: false
     default: ''
   max-file-bytes:
-    description: 'Any single tracked file larger than this is left out of the source archive (default 2 MB). Oversized files are not analyzable source — the common case is a Figma-exported .svg carrying a base64 raster. Raise it if your repo has legitimately large source files.'
+    description: 'Any single tracked file larger than this is left out of the source archive (default 2 MB). Oversized files are not analyzable source; the common case is a Figma-exported .svg carrying a base64 raster. Raise it if your repo has legitimately large source files. Lockfiles (package-lock.json, yarn.lock, pnpm-lock.yaml, Gemfile.lock, composer.lock, poetry.lock, Pipfile.lock, Cargo.lock, go.sum) are exempt.'
     required: false
     default: '2097152'
   publish-check-run:
@@ -35,9 +35,42 @@ inputs:
     required: false
     default: 'true'
   poll-timeout:
-    description: 'Max seconds to wait for a result. Large or security-sensitive PRs run a deeper agentic sweep that can run well over an hour under shared-GPU contention. NOTE: the server job TTL (COMPLIANCE_PR_JOB_TTL_SECONDS, default 3h15m and never lower; the server raises any smaller value to that floor) must be >= this value, or a job running past the TTL returns job_not_found mid-poll instead of finishing. Raising poll-timeout above 3h15m needs the server TTL raised to match.'
+    description: 'Max seconds to wait for a result. Sent to the server as client_timeout, so it can expire a job nobody will read. Large or security-sensitive PRs run a deeper agentic sweep that can run well over an hour under shared-GPU contention. NOTE: the server job TTL (COMPLIANCE_PR_JOB_TTL_SECONDS, default 3h15m and never lower; the server raises any smaller value to that floor) must be >= this value, or a job running past the TTL returns job_not_found mid-poll instead of finishing. Raising poll-timeout above 3h15m needs the server TTL raised to match. The default drops to 5400 once the server run budget is live.'
     required: false
     default: '10800'
+  max-queue:
+    description: 'Max seconds the job may wait in the server queue before it starts. Sent to the server as max_queue; the server clamps it. Empty means poll-timeout minus 3600 (7200 with the default poll-timeout).'
+    required: false
+    default: ''
+  enforce:
+    description: 'How the result decides the job. hard: fail unless the verdict is clean or warn, and also when the server says the run was not fully assessed. verdict-only: fail on the verdict only; the named check shows neutral instead of failure. advisory: never fail; warnings only, and the named check shows neutral. Give-ups (no verdict from the server) count as a blocked verdict.'
+    required: false
+    default: 'hard'
+  upload-report:
+    description: 'Upload the full report (and the raw result) as a workflow artifact. A PR comment over 60,000 characters is cut and points to it.'
+    required: false
+    default: 'true'
+  previous-comments:
+    description: 'keep (default) leaves earlier compliance comments as they are. minimize hides the earlier comments this job posted on the PR as outdated.'
+    required: false
+    default: 'keep'
+
+outputs:
+  outcome:
+    description: 'What happened to the run: analysed, a blocked reason, a server error_code, an action give-up, or skipped. See the README outcome table.'
+    value: ${{ steps.record.outputs.outcome || steps.diff.outputs.outcome }}
+  verdict:
+    description: 'clean, warn, fail or blocked. Empty when the run was skipped.'
+    value: ${{ steps.record.outputs.verdict }}
+  assessment:
+    description: 'complete, partial, not_assessed or nothing_to_assess when the server sends it; empty otherwise.'
+    value: ${{ steps.record.outputs.assessment }}
+  job-id:
+    description: 'The compliance API job id, once submitted.'
+    value: ${{ steps.record.outputs.job-id }}
+  report-artifact:
+    description: 'Name of the workflow artifact with the full report.'
+    value: ${{ steps.comment.outputs.artifact-name }}
 
 runs:
   using: 'composite'
@@ -55,6 +88,11 @@ runs:
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: |
+        . "${{ github.action_path }}/scripts/lib.sh"
+        # Start clean. Self-hosted runners keep /tmp between jobs, and a stale
+        # outcome.txt would make every later step skip.
+        cc_reset_state
+
         MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
         # Persist the merge-base so the submit step can send it as base_sha —
         # the server keys baseline lookup + delta on (repo_id, base_sha).
@@ -81,14 +119,17 @@ runs:
         if [ "$CHANGED_LINES" -eq 0 ]; then
           echo "::notice::No substantive changes (whitespace-only, metadata-only, or net-empty PR) — skipping compliance analysis."
           echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "outcome=skipped" >> "$GITHUB_OUTPUT"
           exit 0
         fi
         echo "skip=false" >> "$GITHUB_OUTPUT"
 
-        # Guard: fail if diff exceeds the 5 MB server-side cap
+        # Guard: the server refuses diffs over 5 MB. Record a give-up (outcome,
+        # comment, blocked verdict) instead of a bare error; the enforce step
+        # decides the job.
         if [ "$DIFF_SIZE" -gt 5242880 ]; then
-          echo "::error::Diff size (${DIFF_SIZE} bytes) exceeds the 5 MB server limit. Please split the PR into smaller changes."
-          exit 1
+          cc_give_up diff_too_large "The diff is ${DIFF_SIZE} bytes, over the 5 MB server limit."
+          exit 0
         fi
 
         # Collect subject + body per commit, NUL-delimited to safely handle newlines.
@@ -98,7 +139,20 @@ runs:
         git log "$MERGE_BASE".."$HEAD_SHA" --format="%s%n%n%b%x00" | \
           awk 'BEGIN{RS="\0"} {gsub(/[[:space:]]+$/, ""); if (length > 0) print}' | \
           jq -R . | jq -s . > /tmp/commit_messages.json
-        echo "Commit messages: $(cat /tmp/commit_messages.json)"
+        echo "Commit messages: $(jq -c . /tmp/commit_messages.json)"
+
+    # GitHub does not pass secrets to pull_request workflows from forks. An
+    # empty key becomes outcome not_run_fork (or missing_api_key), a comment
+    # and a blocked verdict, never a silent pass.
+    - name: Check the API key
+      if: steps.diff.outputs.skip != 'true'
+      shell: bash
+      env:
+        COMPLIANCE_API_KEY: ${{ inputs.api-key }}
+        IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: bash "${{ github.action_path }}/scripts/check-key.sh"
 
     - name: Package source for the agentic sweep
       if: steps.diff.outputs.skip != 'true'
@@ -106,113 +160,16 @@ runs:
       env:
         SOURCE_EXCLUDES: ${{ inputs.source-excludes }}
         MAX_FILE_BYTES: ${{ inputs.max-file-bytes }}
-      run: |
-        # The agentic engine reads the actual code; upload the checked-out HEAD
-        # so it can. FAST is deprecated: without this (and no configured codebase
-        # reuse) the server returns BLOCKED, not a pass.
-        #
-        # The member list comes from git, not from the directory. tar has no
-        # concept of .gitignore, so tarring the workspace archives whatever an
-        # earlier workflow step happened to leave on disk (build output, caches,
-        # fixtures). Tracked-only makes that whole class of bloat unreachable
-        # instead of relying on an exclude list to enumerate it.
-        cd "$GITHUB_WORKSPACE"
-
-        # Members the scanner cannot read as source. Two independent rules,
-        # because neither catches the other's case: compiled/packaged binaries
-        # by extension (a vendored apktool.jar is 20 MB and gzip can't touch an
-        # already-compressed archive), and a per-file size cap for oversized
-        # text (Figma exports raster JPEGs base64-embedded inside .svg wrappers,
-        # which routinely weigh 20 MB+ each and are not binary by extension).
-        # .svg is deliberately NOT listed: an SVG can carry <script>, so small
-        # ones stay in scope and only oversized ones fall to the size cap below.
-        BIN_EXT='jar|war|ear|aar|apk|aab|ipa|dex|class|zip|7z|rar|gz|tgz|bz2|xz|zst|iso|dmg|exe|msi|dll|so|dylib|rlib|pyc|pyo|wasm|pdf|psd|ai|sketch|fig|eps|mp4|mov|avi|mkv|webm|mp3|wav|flac|ogg|ttf|otf|woff|woff2|eot|db|sqlite|sqlite3|mdb|dump|bin|pack|idx|node|whl|egg|jasper|png|jpg|jpeg|gif|webp|bmp|tif|tiff|ico|avif|heic'
-        MAX_FILE_BYTES="${MAX_FILE_BYTES:-2097152}"
-
-        # GNU stat on the runner; the BSD form keeps this runnable for local checks.
-        if stat -c '%s' . >/dev/null 2>&1; then
-          _size() { stat -c '%s' "$1"; }
-        else
-          _size() { stat -f '%z' "$1"; }
-        fi
-
-        : > /tmp/source_members.z
-        : > /tmp/source_dropped.txt
-        KEPT=0; DROPPED=0; DROPPED_BYTES=0
-        while IFS= read -r -d '' f; do
-          # Tracked-but-absent (submodule gitlinks, sparse checkouts) — skip quietly.
-          if [ ! -f "$f" ] || [ -L "$f" ]; then
-            continue
-          fi
-          EXT="${f##*.}"
-          REASON=""
-          if printf '%s' "$EXT" | grep -qiE "^(${BIN_EXT})$"; then
-            REASON="binary type .${EXT}"
-          else
-            FSZ=$(_size "$f" 2>/dev/null || echo 0)
-            if [ "$FSZ" -gt "$MAX_FILE_BYTES" ]; then
-              REASON="${FSZ} bytes > per-file cap ${MAX_FILE_BYTES}"
-            fi
-          fi
-          if [ -n "$REASON" ]; then
-            FSZ=${FSZ:-$(_size "$f" 2>/dev/null || echo 0)}
-            printf '%12s  %s  (%s)\n' "$FSZ" "$f" "$REASON" >> /tmp/source_dropped.txt
-            DROPPED=$((DROPPED + 1)); DROPPED_BYTES=$((DROPPED_BYTES + FSZ))
-            unset FSZ
-            continue
-          fi
-          unset FSZ
-          # Keep the ./ prefix so member names stay identical to previous releases.
-          printf './%s\0' "$f" >> /tmp/source_members.z
-          KEPT=$((KEPT + 1))
-        done < <(git ls-files -z)
-
-        # Consumer-supplied extra excludes, one glob per line or comma-separated.
-        EXTRA_ARGS=()
-        if [ -n "$SOURCE_EXCLUDES" ]; then
-          # `|| [ -n "$pat" ]` so the final pattern survives the missing trailing
-          # newline; trim only surrounding blanks, since a glob may contain spaces.
-          while IFS= read -r pat || [ -n "$pat" ]; do
-            pat="${pat#"${pat%%[![:space:]]*}"}"
-            pat="${pat%"${pat##*[![:space:]]}"}"
-            if [ -n "$pat" ]; then
-              EXTRA_ARGS+=(--exclude="$pat")
-              echo "Extra exclude: $pat"
-            fi
-          done < <(printf '%s' "$SOURCE_EXCLUDES" | tr ',' '\n')
-        fi
-
-        tar czf /tmp/source.tar.gz \
-          --exclude='.git' --exclude='node_modules' --exclude='vendor' \
-          --exclude='tmp' --exclude='log' --exclude='.bundle' --exclude='*.log' \
-          "${EXTRA_ARGS[@]}" \
-          --null -T /tmp/source_members.z
-
-        SZ=$(wc -c < /tmp/source.tar.gz | tr -d ' ')
-        echo "Packaged ${KEPT} tracked files; dropped ${DROPPED} unreadable-as-source (${DROPPED_BYTES} bytes)."
-        echo "source.tar.gz: ${SZ} bytes"
-
-        if [ "$SZ" -gt 104857600 ]; then
-          # Show what to fix rather than just refusing. Without this the consumer
-          # is told to "add excludes" with no idea which files are the problem.
-          echo "::error::Source archive ${SZ} bytes exceeds the 100 MB server cap."
-          echo "Largest members still in the archive:"
-          tr '\0' '\n' < /tmp/source_members.z | sed 's|^\./||' | while IFS= read -r f; do
-            [ -f "$f" ] && printf '%12s  %s\n' "$(_size "$f")" "$f"
-          done | sort -rn | head -25
-          echo "Set the 'source-excludes' input to drop these, or lower 'max-file-bytes' (currently ${MAX_FILE_BYTES})."
-          exit 1
-        fi
-
-        if [ "$SZ" -gt 83886080 ]; then
-          echo "::warning::Source archive is ${SZ} bytes — over 80% of the 100 MB cap. Consider trimming large assets before it starts failing."
-        fi
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: cd "$GITHUB_WORKSPACE" && bash "${{ github.action_path }}/scripts/package-source.sh"
 
     - name: Submit diff to compliance API
       if: steps.diff.outputs.skip != 'true'
       shell: bash
       env:
         COMPLIANCE_API_KEY: ${{ inputs.api-key }}
+        # Set here so a workflow-level env var cannot redirect the key.
+        COMPLIANCE_API_URL: https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check
         FRAMEWORKS: ${{ inputs.frameworks }}
         # PR metadata — sent as multipart form fields (server reads these);
         # values injected via env so PR titles with quotes can't break the shell.
@@ -222,209 +179,45 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         PR_TITLE: ${{ github.event.pull_request.title }}
         PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-      run: |
-        # Strip CR/LF and surrounding blanks from the key. A secret pasted with
-        # a trailing newline puts a bare LF inside the Authorization header
-        # value; the LF then reads as a header-line terminator and the CRLF
-        # after it as the blank line ending the header block. curl's remaining
-        # headers — Content-Length and Content-Type — land in the BODY, the
-        # server never sees a multipart content type, and the source archive is
-        # silently dropped. The request still authenticates, so it surfaces as a
-        # BLOCKED verdict rather than an auth error. Cheap to prevent here.
-        COMPLIANCE_API_KEY="$(printf '%s' "$COMPLIANCE_API_KEY" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-        if [ -z "$COMPLIANCE_API_KEY" ]; then
-          echo "::error::api-key is empty after trimming whitespace."
-          exit 1
-        fi
-
-        COMMIT_MESSAGES=$(cat /tmp/commit_messages.json)
-
-        # The archive must exist and be non-empty, or curl silently posts a
-        # request the server cannot use.
-        if [ ! -s /tmp/source.tar.gz ]; then
-          echo "::error::/tmp/source.tar.gz is missing or empty — refusing to submit."
-          exit 1
-        fi
-
-        # Include README only if it exists in the repo root
-        if [ -f README.md ]; then
-          README_ARG=(-F "readme=@README.md;type=text/plain")
-        else
-          README_ARG=()
-        fi
-
-        # Include frameworks only if the input was provided
-        if [ -n "$FRAMEWORKS" ]; then
-          FRAMEWORKS_ARG=(-F "frameworks=$FRAMEWORKS")
-        else
-          FRAMEWORKS_ARG=()
-        fi
-
-        # Submit is rate-limited per consumer just like the status endpoint, so it
-        # has to honour 429/retry_after_seconds too — otherwise a rate-limited
-        # submit just falls through to the missing-job_id error below.
-        SUBMIT_MAX_ATTEMPTS=5
-        SUBMIT_ATTEMPT=0
-        while :; do
-          SUBMIT_ATTEMPT=$((SUBMIT_ATTEMPT + 1))
-
-          HTTP_CODE=$(curl -sS -X POST \
-            -H "Authorization: Bearer $COMPLIANCE_API_KEY" \
-            -F "diff=@/tmp/pr.diff;type=text/plain" \
-            -F "source=@/tmp/source.tar.gz;type=application/gzip" \
-            "${README_ARG[@]}" \
-            -F "commit_messages=$COMMIT_MESSAGES" \
-            "${FRAMEWORKS_ARG[@]}" \
-            -F "repo_id=$REPO_ID" \
-            -F "base_sha=$BASE_SHA" \
-            -F "head_sha=$HEAD_SHA" \
-            -F "pr_number=$PR_NUMBER" \
-            -F "pr_title=$PR_TITLE" \
-            -F "pr_author=$PR_AUTHOR" \
-            --max-time 300 \
-            -o /tmp/submit_response.json \
-            -w "%{http_code}" \
-            "https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check/")
-
-          echo "Submit attempt $SUBMIT_ATTEMPT - HTTP: $HTTP_CODE"
-          if [ "$HTTP_CODE" != "429" ]; then
-            break
-          fi
-
-          if [ "$SUBMIT_ATTEMPT" -ge "$SUBMIT_MAX_ATTEMPTS" ]; then
-            echo "::error::Submit rate-limited (HTTP 429) after ${SUBMIT_ATTEMPT} attempts."
-            cat /tmp/submit_response.json
-            exit 1
-          fi
-
-          # A gateway-level 429 has no JSON body, so this parse must never abort
-          # the step; fall back to 60s and cap the server-supplied value.
-          RETRY_AFTER=$(jq -r '.retry_after_seconds // empty' /tmp/submit_response.json 2>/dev/null || true)
-          case "$RETRY_AFTER" in
-            ''|*[!0-9]*) RETRY_AFTER=60 ;;
-          esac
-          if [ "$RETRY_AFTER" -gt 300 ]; then
-            RETRY_AFTER=300
-          fi
-          echo "Rate limited on submit. Waiting ${RETRY_AFTER}s before retrying..."
-          sleep "$RETRY_AFTER"
-        done
-
-        JOB_ID=$(jq -r '.job_id // empty' /tmp/submit_response.json 2>/dev/null || true)
-        if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "null" ]; then
-          echo "::error::Submit did not return a job_id (HTTP ${HTTP_CODE})"
-          cat /tmp/submit_response.json
-          exit 1
-        fi
-        echo "$JOB_ID" > /tmp/job_id.txt
-        echo "Submitted job: $JOB_ID"
+        POLL_TIMEOUT_SECONDS: ${{ inputs.poll-timeout }}
+        MAX_QUEUE_SECONDS: ${{ inputs.max-queue }}
+      run: cd "$GITHUB_WORKSPACE" && bash "${{ github.action_path }}/scripts/submit.sh"
 
     - name: Poll for result
       if: steps.diff.outputs.skip != 'true'
       shell: bash
       env:
         COMPLIANCE_API_KEY: ${{ inputs.api-key }}
+        COMPLIANCE_API_URL: https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check
         POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval }}
         POLL_TIMEOUT_SECONDS: ${{ inputs.poll-timeout }}
-      run: |
-        # Same trim as the submit step — see the note there.
-        COMPLIANCE_API_KEY="$(printf '%s' "$COMPLIANCE_API_KEY" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-
-        JOB_ID=$(cat /tmp/job_id.txt)
-
-        DEADLINE=$(( $(date +%s) + POLL_TIMEOUT_SECONDS ))
-        ATTEMPT=0
-        while :; do
-          ATTEMPT=$((ATTEMPT + 1))
-          if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-            echo "::error::Polling timed out after ${POLL_TIMEOUT_SECONDS}s"
-            exit 1
-          fi
-
-          HTTP_CODE=$(curl -sS \
-            -H "Authorization: Bearer $COMPLIANCE_API_KEY" \
-            --max-time 30 \
-            -o /tmp/poll_response.json \
-            -w "%{http_code}" \
-            "https://llm.ubicomply.ai/sast/api/v1/compliance/pr-check/jobs/${JOB_ID}")
-
-          echo "Attempt $ATTEMPT - HTTP: $HTTP_CODE"
-
-          # Handle 429 rate limit — honour Retry-After from response body.
-          # A gateway-level 429 has no JSON body, so this parse must never abort
-          # the step; fall back to 60s and cap the server-supplied value.
-          if [ "$HTTP_CODE" = "429" ]; then
-            RETRY_AFTER=$(jq -r '.retry_after_seconds // empty' /tmp/poll_response.json 2>/dev/null || true)
-            case "$RETRY_AFTER" in
-              ''|*[!0-9]*) RETRY_AFTER=60 ;;
-            esac
-            if [ "$RETRY_AFTER" -gt 300 ]; then
-              RETRY_AFTER=300
-            fi
-            echo "Rate limited. Waiting ${RETRY_AFTER}s before retrying..."
-            sleep "$RETRY_AFTER"
-            continue
-          fi
-
-          STATUS=$(jq -r '.status // "unknown"' /tmp/poll_response.json)
-          echo "status: $STATUS"
-
-          case "$STATUS" in
-            success)
-              jq -r '.result' /tmp/poll_response.json > /tmp/api_response.md
-              # No "?" placeholder: an absent verdict stays empty, and the
-              # enforce step fails the check on it (T04).
-              jq -r '.overall_status // ""' /tmp/poll_response.json > /tmp/overall_status.txt
-              # Named check + annotations (C2.9). Absent on older servers;
-              # the publish step then skips.
-              jq -c '.check_run // empty' /tmp/poll_response.json > /tmp/check_run.json
-              jq -r '(.annotations // [])[]' /tmp/poll_response.json > /tmp/annotations.txt
-              echo "Got result ($(wc -c < /tmp/api_response.md) bytes); verdict: $(cat /tmp/overall_status.txt)"
-              break
-              ;;
-            failed)
-              ERR=$(jq -r '.error // "unknown error"' /tmp/poll_response.json)
-              printf '## 🔒 Compliance Review\n\n❌ Analysis failed.\n\n```\n%s\n```\n' "$ERR" \
-                > /tmp/api_response.md
-              echo "blocked" > /tmp/overall_status.txt
-              break
-              ;;
-            pending|running|queued)
-              sleep "$POLL_INTERVAL_SECONDS"
-              ;;
-            unknown)
-              # Handle job_not_found or any response missing a status field
-              ERR=$(jq -r '.error // "unknown error"' /tmp/poll_response.json)
-              if [ "$ERR" = "job_not_found" ]; then
-                echo "::error::Job ${JOB_ID} not found on server."
-                exit 1
-              fi
-              echo "::error::Unexpected response: $ERR"
-              cat /tmp/poll_response.json
-              exit 1
-              ;;
-            *)
-              echo "::error::Unexpected status: $STATUS"
-              cat /tmp/poll_response.json
-              exit 1
-              ;;
-          esac
-        done
+        MAX_QUEUE_SECONDS: ${{ inputs.max-queue }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: bash "${{ github.action_path }}/scripts/poll-job.sh"
 
     - name: Post comment on PR
+      id: comment
       if: steps.diff.outputs.skip != 'true'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         REPO: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
-      run: |
-        BODY=$(jq -Rs '{body: .}' < /tmp/api_response.md)
-        curl -sS -X POST \
-          -H "Authorization: Bearer $GITHUB_TOKEN" \
-          -H "Accept: application/vnd.github+json" \
-          -d "$BODY" \
-          "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments"
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        FRAMEWORKS: ${{ inputs.frameworks }}
+        UPLOAD_REPORT: ${{ inputs.upload-report }}
+        PREVIOUS_COMMENTS: ${{ inputs.previous-comments }}
+      # Never decides the job: every failure is a warning and it exits 0.
+      run: bash "${{ github.action_path }}/scripts/post-comment.sh"
+
+    - name: Upload the full report
+      if: steps.diff.outputs.skip != 'true' && inputs.upload-report == 'true' && steps.comment.outputs.artifact-name != ''
+      continue-on-error: true
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.comment.outputs.artifact-name }}
+        path: /tmp/compliance-report
+        if-no-files-found: ignore
 
     - name: Publish check run and annotations
       if: steps.diff.outputs.skip != 'true' && inputs.publish-check-run == 'true'
@@ -433,14 +226,69 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         REPO: ${{ github.repository }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        ENFORCE: ${{ inputs.enforce }}
       # Never decides the job: every failure is a warning and the script
-      # exits 0. The next step enforces the verdict exactly as before.
+      # exits 0. The enforce step decides the job.
       run: bash "${{ github.action_path }}/scripts/publish-check-run.sh" /tmp/check_run.json /tmp/annotations.txt
+
+    # A step above failed before the run had an outcome (git, checkout, disk).
+    # Say so on the PR instead of leaving only a red job.
+    - name: Report an action error
+      id: crash
+      if: failure() && steps.diff.outputs.skip != 'true'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        FRAMEWORKS: ${{ inputs.frameworks }}
+        UPLOAD_REPORT: 'false'
+      run: |
+        . "${{ github.action_path }}/scripts/lib.sh"
+        if cc_decided; then
+          exit 0
+        fi
+        cc_give_up action_error "A step of the action failed before the run had an outcome. See the job log."
+        bash "${{ github.action_path }}/scripts/post-comment.sh"
+
+    - name: Record the outcome
+      id: record
+      if: always() && steps.diff.outputs.skip != 'true'
+      shell: bash
+      env:
+        ENFORCE: ${{ inputs.enforce }}
+      run: |
+        val() {
+          if [ -s "/tmp/$1" ]; then head -n1 "/tmp/$1" | tr -cd 'A-Za-z0-9._-' | cut -c1-128; fi
+        }
+        OUTCOME=$(val outcome.txt)
+        VERDICT=$(val overall_status.txt)
+        ASSESSMENT=$(val assessment.txt)
+        JOB=$(val job_id.txt)
+        {
+          echo "outcome=$OUTCOME"
+          echo "verdict=$VERDICT"
+          echo "assessment=$ASSESSMENT"
+          echo "job-id=$JOB"
+        } >> "$GITHUB_OUTPUT"
+        MODE=$(printf '%s' "${ENFORCE:-hard}" | tr -cd 'A-Za-z0-9._-' | cut -c1-20)
+        {
+          echo "### Compliance Check"
+          echo
+          echo "| Outcome | Verdict | Assessment | Enforce | Job |"
+          echo "|---|---|---|---|---|"
+          echo "| ${OUTCOME:--} | ${VERDICT:--} | ${ASSESSMENT:--} | ${MODE:-hard} | ${JOB:--} |"
+        } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Enforce compliance verdict
       if: steps.diff.outputs.skip != 'true'
       shell: bash
-      # Fails closed: only clean and warn pass. fail, blocked (the analysis
-      # could not run), a missing verdict and an unknown one all fail the
-      # check, so it blocks the merge with branch protection.
-      run: bash "${{ github.action_path }}/scripts/enforce-verdict.sh" /tmp/overall_status.txt
+      env:
+        ENFORCE: ${{ inputs.enforce }}
+      # hard (default) fails closed like v1.6: only clean and warn pass. fail,
+      # blocked (the analysis could not run, or a give-up), a missing verdict
+      # and an unknown one all fail the check, so it blocks the merge with
+      # branch protection. hard also fails a run the server did not fully
+      # assess. verdict-only ignores the assessment; advisory only warns.
+      run: bash "${{ github.action_path }}/scripts/enforce-verdict.sh" /tmp/overall_status.txt /tmp/outcome.txt /tmp/assessment.txt
